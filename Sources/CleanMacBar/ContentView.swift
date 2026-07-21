@@ -123,6 +123,11 @@ struct ContentView: View {
 
     @ViewBuilder
     private var cleanSection: some View {
+        Toggle("휴지통 비우기 포함 (복구 불가)", isOn: $model.includeTrash)
+            .toggleStyle(.checkbox)
+            .font(.system(size: 11))
+            .disabled(model.scanning || model.cleaning)
+
         if let message = model.resultMessage {
             Text(message)
                 .font(.system(size: 12, weight: .semibold))
@@ -136,6 +141,15 @@ struct ContentView: View {
                         Text(target.name)
                         Spacer()
                         Text(formatBytes(target.size))
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 12))
+                }
+                if model.includeTrash {
+                    HStack {
+                        Text("휴지통")
+                        Spacer()
+                        Text(model.trashCount.map { "\($0)개 항목" } ?? "권한 필요")
                             .foregroundStyle(.secondary)
                     }
                     .font(.system(size: 12))

@@ -11,7 +11,7 @@ func runClean(options: CleanOptions) {
     print(ANSI.bold("🧹 cleanmac 캐시 정리"))
     print(ANSI.dim("크기를 계산하는 중입니다… (캐시가 많으면 시간이 걸릴 수 있습니다)"))
 
-    let targets = scanCleanTargets(includeTrash: options.includeTrash)
+    let targets = scanCleanTargets()
 
     printSection("정리 대상")
     var totalSize: Int64 = 0
@@ -20,6 +20,11 @@ func runClean(options: CleanOptions) {
         let name = target.name.padding(toLength: 22, withPad: " ", startingAt: 0)
         let size = formatBytes(target.size).padding(toLength: 12, withPad: " ", startingAt: 0)
         print("  \(name) \(ANSI.bold(size)) \(ANSI.dim(target.note))")
+    }
+    if options.includeTrash {
+        let name = "휴지통".padding(toLength: 22, withPad: " ", startingAt: 0)
+        let count = trashItemCount().map { "\($0)개 항목" } ?? "권한 필요"
+        print("  \(name) \(ANSI.bold(count.padding(toLength: 12, withPad: " ", startingAt: 0))) \(ANSI.dim("Finder로 비움 (복구 불가)"))")
     }
     print("")
     print("  합계: \(ANSI.bold(ANSI.green(formatBytes(totalSize))))")
@@ -58,6 +63,13 @@ func runClean(options: CleanOptions) {
         freed += result.freed
         skipped += result.skipped
         print("  \(ANSI.green("✓")) \(target.name): \(formatBytes(result.freed)) 확보")
+    }
+    if options.includeTrash {
+        if emptyTrash() {
+            print("  \(ANSI.green("✓")) 휴지통 비움")
+        } else {
+            print("  \(ANSI.yellow("⚠")) 휴지통을 비우지 못했습니다. Finder 자동화 권한을 허용해 주세요.")
+        }
     }
 
     print("")
