@@ -3,7 +3,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-swift build -c release
+if ! swift build -c release 2>/dev/null; then
+    echo "ℹ️ swift build 대신 swiftc 직접 빌드로 진행합니다..."
+    mkdir -p .build/release /tmp/cleanmac-module-cache
+    swiftc -O -module-cache-path /tmp/cleanmac-module-cache -parse-as-library -emit-library -emit-module \
+        -module-name CleanMacCore Sources/CleanMacCore/*.swift \
+        -emit-module-path /tmp/cleanmac-module-cache/CleanMacCore.swiftmodule \
+        -o /tmp/cleanmac-module-cache/libCleanMacCore.a
+    swiftc -O -module-cache-path /tmp/cleanmac-module-cache -I /tmp/cleanmac-module-cache \
+        Sources/cleanmac/*.swift /tmp/cleanmac-module-cache/libCleanMacCore.a \
+        -o .build/release/cleanmac
+    swiftc -O -module-cache-path /tmp/cleanmac-module-cache -I /tmp/cleanmac-module-cache -parse-as-library \
+        Sources/CleanMacBar/*.swift /tmp/cleanmac-module-cache/libCleanMacCore.a \
+        -o .build/release/CleanMacBar
+fi
 
 APP="CleanMac.app"
 rm -rf "$APP"
@@ -24,7 +37,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

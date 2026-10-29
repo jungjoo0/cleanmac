@@ -1,12 +1,15 @@
 import Foundation
+import Darwin
 
 public struct ProcessSample: Identifiable, Sendable {
-    public let id = UUID()
+    public var id: String { "\(pid)-\(name)" }
+    public let pid: Int32
     public let name: String
     public let cpuPercent: Double
     public let memoryBytes: Int64
 
-    public init(name: String, cpuPercent: Double, memoryBytes: Int64) {
+    public init(pid: Int32 = 0, name: String, cpuPercent: Double, memoryBytes: Int64) {
+        self.pid = pid
         self.name = name
         self.cpuPercent = cpuPercent
         self.memoryBytes = memoryBytes
@@ -47,6 +50,25 @@ public struct SystemReport: Sendable {
 
     public var usedMemory: Int64 { activeMemory + wiredMemory + compressedMemory }
 
+    public var memoryUsageRatio: Double {
+        guard totalMemory > 0 else { return 0 }
+        return min(max(Double(usedMemory) / Double(totalMemory), 0), 1)
+    }
+
+    public var diskUsedBytes: Int64 {
+        max(diskTotal - diskAvailable, 0)
+    }
+
+    public var diskUsageRatio: Double {
+        guard diskTotal > 0 else { return 0 }
+        return min(max(Double(diskUsedBytes) / Double(diskTotal), 0), 1)
+    }
+
+    public var cpuLoadRatio: Double {
+        guard coreCount > 0, let load1 = loadAverages.first else { return 0 }
+        return min(max(load1 / Double(coreCount), 0), 1)
+    }
+
     public var uptime: TimeInterval? {
         bootTime.map { Date().timeIntervalSince($0) }
     }
@@ -55,30 +77,28 @@ public struct SystemReport: Sendable {
 public func collectSystemReport() -> SystemReport {
     var report = SystemReport()
 
-    report.osVersion = shell("/usr/bin/sw_vers", ["-productVersion"])
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    report.model = sysctl("hw.model")
-    report.bootTime = parseBootTime()
-    report.coreCount = Int(sysctl("hw.ncpu")) ?? 1
+    report.osVersion = sysctlString("kern.osproductversion")
+        ?? shell("/usr/bin/sw_vers", ["-productVersion"]).trimmingCharacters(in: .whitespacesAndNewlines)
+    report.model = sysctlString("hw.model") ?? sysctl("hw.model")
+    report.bootTime = readBootTime()
+    report.coreCount = max(ProcessInfo.processInfo.processorCount, 1)
 
-    // "{ 1.23 1.45 1.60 }"
-    report.loadAverages = sysctl("vm.loadavg")
-        .replacingOccurrences(of: "{", with: "")
-        .replacingOccurrences(of: "}", with: "")
-        .split(separator: " ")
-        .compactMap { Double($0) }
+    var loads = [Double](repeating: 0, count: 3)
+    if getloadavg(&loads, 3) == 3 {
+        report.loadAverages = loads.map { ( $0 * 100 ).rounded() / 100 }
+    }
 
-    report.totalMemory = Int64(sysctl("hw.memsize")) ?? 0
-    if let vm = parseVMStat() {
+    report.totalMemory = Int64(ProcessInfo.processInfo.physicalMemory)
+    if let vm = readMachVMStat() ?? parseVMStat() {
         report.activeMemory = vm.active
         report.wiredMemory = vm.wired
         report.compressedMemory = vm.compressed
     }
-    if let swap = parseSwapUsage() {
+    if let swap = readSwapUsage() ?? parseSwapUsage() {
         report.swapTotal = swap.total
         report.swapUsed = swap.used
     }
-    report.memoryPressureLevel = Int(sysctl("kern.memorystatus_vm_pressure_level")) ?? 1
+    report.memoryPressureLevel = Int(sysctlInt64("kern.memorystatus_vm_pressure_level") ?? 1)
 
     if let disk = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [
         .volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey
@@ -88,8 +108,9 @@ public func collectSystemReport() -> SystemReport {
         report.diskAvailable = available
     }
 
-    report.topCPU = topProcesses(sortFlag: "-r")
-    report.topMemory = topProcesses(sortFlag: "-m")
+    let processes = sampleAllProcesses(limit: 5)
+    report.topCPU = processes.topCPU
+    report.topMemory = processes.topMemory
     report.launchItems = collectLaunchItems()
     report.warnings = makeWarnings(for: report)
     return report
@@ -111,7 +132,7 @@ private func makeWarnings(for report: SystemReport) -> [String] {
         warnings.append("1분 로드 평균(\(load1))이 코어 수(\(report.coreCount))를 넘습니다. CPU가 과부하 상태입니다.")
     }
     for process in report.topCPU where process.cpuPercent > 80 {
-        warnings.append("'\(process.name)' 프로세스가 CPU를 \(String(format: "%.0f", process.cpuPercent))% 사용 중입니다.")
+        warnings.append("'\(process.name)' (PID \(process.pid)) 프로세스가 CPU를 \(String(format: "%.0f", process.cpuPercent))% 사용 중입니다.")
     }
 
     if report.totalMemory > 0, report.compressedMemory > report.totalMemory / 5 {
@@ -142,16 +163,28 @@ private func makeWarnings(for report: SystemReport) -> [String] {
 
 // MARK: - 수집 헬퍼
 
-private func topProcesses(sortFlag: String, limit: Int = 5) -> [ProcessSample] {
-    // pcpu(%), rss(KB), comm(명령 이름)
-    let output = shell("/bin/ps", ["-Aceo", "pcpu,rss,comm", sortFlag])
-    return output.split(separator: "\n").dropFirst().prefix(limit).compactMap { line in
-        let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard parts.count == 3,
-              let cpu = Double(parts[0]),
-              let rssKB = Int64(parts[1]) else { return nil }
-        return ProcessSample(name: String(parts[2]), cpuPercent: cpu, memoryBytes: rssKB * 1024)
+private func sampleAllProcesses(limit: Int = 5) -> (topCPU: [ProcessSample], topMemory: [ProcessSample]) {
+    // 단일 ps 호출로 pid, pcpu(%), rss(KB), comm(명령 이름)을 수집한 뒤 메모리에서 정렬한다.
+    let output = shell("/bin/ps", ["-Aceo", "pid,pcpu,rss,comm"])
+    var all: [ProcessSample] = []
+    for line in output.split(separator: "\n").dropFirst() {
+        let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+        guard parts.count == 4,
+              let pid = Int32(parts[0]),
+              let cpu = Double(parts[1]),
+              let rssKB = Int64(parts[2]) else { continue }
+        all.append(
+            ProcessSample(
+                pid: pid,
+                name: String(parts[3]),
+                cpuPercent: cpu,
+                memoryBytes: rssKB * 1024
+            )
+        )
     }
+    let topCPU = Array(all.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(limit))
+    let topMemory = Array(all.sorted { $0.memoryBytes > $1.memoryBytes }.prefix(limit))
+    return (topCPU, topMemory)
 }
 
 private func collectLaunchItems() -> [LaunchItemGroup] {
@@ -163,17 +196,22 @@ private func collectLaunchItems() -> [LaunchItemGroup] {
     ]
     return agentDirs.map { path, label in
         let items = (try? FileManager.default.contentsOfDirectory(atPath: path))?
-            .filter { $0.hasSuffix(".plist") } ?? []
+            .filter { $0.hasSuffix(".plist") }
+            .sorted() ?? []
         return LaunchItemGroup(label: label, items: items)
     }
 }
 
-private func parseBootTime() -> Date? {
-    // "{ sec = 1720000000, usec = 0 } ..."
+private func readBootTime() -> Date? {
+    var boottime = timeval()
+    var size = MemoryLayout<timeval>.size
+    if sysctlbyname("kern.boottime", &boottime, &size, nil, 0) == 0, boottime.tv_sec > 0 {
+        return Date(timeIntervalSince1970: TimeInterval(boottime.tv_sec))
+    }
     let raw = sysctl("kern.boottime")
     guard let secRange = raw.range(of: "sec = "),
-          let comma = raw[secRange.upperBound...].firstIndex(of: ",") else { return nil }
-    guard let sec = TimeInterval(raw[secRange.upperBound..<comma]) else { return nil }
+          let comma = raw[secRange.upperBound...].firstIndex(of: ","),
+          let sec = TimeInterval(raw[secRange.upperBound..<comma]) else { return nil }
     return Date(timeIntervalSince1970: sec)
 }
 
@@ -181,6 +219,23 @@ private struct VMStat {
     var active: Int64 = 0
     var wired: Int64 = 0
     var compressed: Int64 = 0
+}
+
+private func readMachVMStat() -> VMStat? {
+    var stats = vm_statistics64()
+    var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &stats) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+        }
+    }
+    guard result == KERN_SUCCESS else { return nil }
+    let pageSize = Int64(vm_kernel_page_size)
+    return VMStat(
+        active: Int64(stats.active_count) * pageSize,
+        wired: Int64(stats.wire_count) * pageSize,
+        compressed: Int64(stats.compressor_page_count) * pageSize
+    )
 }
 
 private func parseVMStat() -> VMStat? {
@@ -208,8 +263,14 @@ private func parseVMStat() -> VMStat? {
     return stat
 }
 
+private func readSwapUsage() -> (total: Int64, used: Int64)? {
+    var swap = xsw_usage()
+    var size = MemoryLayout<xsw_usage>.size
+    guard sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0 else { return nil }
+    return (total: Int64(swap.xsu_total), used: Int64(swap.xsu_used))
+}
+
 private func parseSwapUsage() -> (total: Int64, used: Int64)? {
-    // "total = 2048.00M  used = 1234.56M  free = 813.44M  (encrypted)"
     let raw = sysctl("vm.swapusage")
     func value(after label: String) -> Int64? {
         guard let range = raw.range(of: "\(label) = ") else { return nil }
